@@ -309,7 +309,7 @@ class EmailService:
     def send_escalation_email(self, recipient_email, subject, body, recipient_name, state, cc_emails=None, department=None):
         """Send escalation email using simplified approach"""
         
-        # Prepare CC list from ALL ACTIVE_EMAILS
+        # Prepare CC list from targeted ACTIVE_EMAILS
         cc_list = []
         if cc_emails:
             if isinstance(cc_emails, str):
@@ -441,7 +441,7 @@ ORIGINAL MESSAGE:
             return False
 
 class XeusDataProcessor:
-    """Main class for processing Xeus data with F_CALENDAR shift detection"""
+    """Main class for processing Xeus data with F_CALENDAR shift detection and targeted CC"""
     
     def __init__(self, test_mode=False):
         self.f11x_db = None
@@ -452,69 +452,106 @@ class XeusDataProcessor:
         if test_mode:
             logger.info("XEUS DATA PROCESSOR INITIALIZED IN TEST MODE")
 
-    def get_rw_departments(self) -> pd.DataFrame:
-        """Get ALL departments from RW_Department table for ACTIVE_EMAILS"""
+    def get_relevant_active_emails_for_factory_org(self, factory_orgs: List[str]) -> List[str]:
+        """
+        Get ACTIVE_EMAILS using SQL LIKE patterns for F11X and F9 FactoryOrgs
+        Simple pattern matching: F11X matches %F11X%, F9 matches %F9%
+        """
+        if not factory_orgs:
+            logger.warning("No FactoryOrgs provided for targeted ACTIVE_EMAILS lookup")
+            return []
+        
+        # Clean and get unique factory orgs
+        unique_factory_orgs = list(set([str(org).upper().strip() for org in factory_orgs if org is not None and str(org) != 'nan']))
+        
+        if not unique_factory_orgs:
+            logger.warning("No valid FactoryOrgs after cleaning")
+            return []
+        
+        # Check if we have F11X or F9 in any of the factory orgs
+        has_f11x = any('F11X' in factory_org for factory_org in unique_factory_orgs)
+        has_f9 = any('F9' in factory_org for factory_org in unique_factory_orgs)
+        
+        if not (has_f11x or has_f9):
+            logger.warning(f"No F11X or F9 patterns found in FactoryOrgs: {unique_factory_orgs}")
+            return []
+        
         try:
-            logger.info("Fetching ALL departments from F11x for ACTIVE_EMAILS")
+            logger.info(f"Fetching targeted ACTIVE_EMAILS for FactoryOrgs: {unique_factory_orgs}")
+            logger.info(f"Pattern matching - F11X: {has_f11x}, F9: {has_f9}")
+            
             with F11xDB() as db:
-                sql = "SELECT RW_Department, ACTIVE_EMAILS FROM RW_Department WHERE Active = 1"
+                # Build WHERE conditions for pattern matching
+                conditions = []
+                if has_f11x:
+                    conditions.append("UPPER(RW_Department) LIKE '%F11X%'")
+                if has_f9:
+                    conditions.append("UPPER(RW_Department) LIKE '%F9%'")
+                
+                where_clause = " OR ".join(conditions)
+                
+                sql = f"""
+                SELECT RW_Department, ACTIVE_EMAILS 
+                FROM RW_Department 
+                WHERE Active = 1 
+                  AND ACTIVE_EMAILS IS NOT NULL
+                  AND ({where_clause})
+                """
+                
                 df = db.pull(sql)
-                logger.info(f"Successfully pulled {len(df)} active departments")
+                logger.info(f"Pattern matching found {len(df)} departments")
                 
-                # Log departments with ACTIVE_EMAILS
-                if 'ACTIVE_EMAILS' in df.columns:
-                    dept_with_emails = df[df['ACTIVE_EMAILS'].notna()]
-                    logger.info(f"Found {len(dept_with_emails)} departments with ACTIVE_EMAILS")
+                all_emails = []
+                matched_departments = []
+                
+                for _, row in df.iterrows():
+                    dept_name = row['RW_Department']
+                    active_emails = row['ACTIVE_EMAILS']
                     
-                    # Show what ACTIVE_EMAILS we found
-                    for _, row in dept_with_emails.iterrows():
-                        emails_preview = str(row['ACTIVE_EMAILS'])[:100] + "..." if len(str(row['ACTIVE_EMAILS'])) > 100 else str(row['ACTIVE_EMAILS'])
-                        logger.info(f"  {row['RW_Department']}: {emails_preview}")
-                else:
-                    logger.warning("ACTIVE_EMAILS column not found in RW_Department table")
+                    # Determine which pattern matched
+                    dept_upper = dept_name.upper()
+                    if 'F11X' in dept_upper:
+                        matched_departments.append(f"F11X pattern: {dept_name}")
+                    elif 'F9' in dept_upper:
+                        matched_departments.append(f"F9 pattern: {dept_name}")
+                    
+                    if pd.notna(active_emails) and str(active_emails).strip():
+                        email_str = str(active_emails).strip()
+                        emails = re.split(r'[;,\s\n\r]+', email_str)
+                        
+                        added_count = 0
+                        for email in emails:
+                            email = email.strip()
+                            if email and '@' in email and '.' in email:
+                                if email not in all_emails:
+                                    all_emails.append(email)
+                                    added_count += 1
+                        
+                        logger.info(f"Added {added_count} emails from {dept_name}")
                 
-                return df
+                # Log all matches
+                logger.info(f"Pattern matching results:")
+                for match in matched_departments:
+                    logger.info(f"  {match}")
+                
+                logger.info(f"Total unique ACTIVE_EMAILS collected: {len(all_emails)}")
+                return all_emails
+                
         except Exception as e:
-            logger.error(f"Error pulling RW_Department data: {e}")
-            return pd.DataFrame()
+            logger.error(f"Error fetching targeted ACTIVE_EMAILS with patterns: {e}")
+            return []
 
-    def get_all_active_emails(self, dept_df: pd.DataFrame) -> List[str]:
+    def get_factory_orgs_from_contacts(self, contacts_df: pd.DataFrame) -> List[str]:
         """
-        Simple approach - get ALL ACTIVE_EMAILS from ALL departments
-        No mapping, no matching - just collect all ACTIVE_EMAILS
+        Extract unique FactoryOrg values from the contacts dataframe
         """
-        if dept_df.empty:
+        if contacts_df.empty or 'FactoryOrg' not in contacts_df.columns:
+            logger.warning("No FactoryOrg data available in contacts")
             return []
         
-        if 'ACTIVE_EMAILS' not in dept_df.columns:
-            logger.warning("ACTIVE_EMAILS column not found in RW_Department table")
-            return []
-        
-        all_emails = []
-        
-        try:
-            # Go through ALL departments and collect their ACTIVE_EMAILS
-            for _, row in dept_df.iterrows():
-                active_emails = row['ACTIVE_EMAILS']
-                
-                if pd.notna(active_emails) and str(active_emails).strip():
-                    # Parse emails from this department
-                    email_str = str(active_emails).strip()
-                    emails = re.split(r'[;,\s\n\r]+', email_str)
-                    
-                    # Clean and add to list
-                    for email in emails:
-                        email = email.strip()
-                        if email and '@' in email and '.' in email:
-                            if email not in all_emails:  # Avoid duplicates
-                                all_emails.append(email)
-            
-            logger.info(f"Collected {len(all_emails)} unique ACTIVE_EMAILS from all departments: {all_emails}")
-            return all_emails
-            
-        except Exception as e:
-            logger.error(f"Error collecting ACTIVE_EMAILS: {e}")
-            return []
+        factory_orgs = contacts_df['FactoryOrg'].dropna().unique().tolist()
+        logger.info(f"Found {len(factory_orgs)} unique FactoryOrgs in contacts: {factory_orgs}")
+        return factory_orgs
 
     def execute_xeus_query(self, dept_filter: str) -> pd.DataFrame:
         """Execute the main Xeus query"""
@@ -924,7 +961,7 @@ class XeusDataProcessor:
                 sample_data = faceid_df.head(3)
                 logger.debug("Sample FACEIDMapping data:")
                 for _, row in sample_data.iterrows():
-                    logger.debug(f"  CEID: {row['CEID']}, SGL4: {row['SGL4']}, SGL5: {row['SGL5']}, SGL6: {row['SGL6']}, SGL7: {row['SGL7']}")
+                    logger.debug(f"  CEID: {row['CEID']}, FactoryOrg: {row['FactoryOrg']}, SGL4: {row['SGL4']}, SGL5: {row['SGL5']}")
             else:
                 logger.warning("No FACEIDMapping data found for the provided CEIDs")
             
@@ -939,7 +976,7 @@ class XeusDataProcessor:
     def transform_faceid_to_contacts_current_shift(self, faceid_df: pd.DataFrame) -> pd.DataFrame:
         """
         Transform FACEIDMapping data but only include CURRENT shift group leader
-        Uses F_CALENDAR to determine current shift
+        Uses F_CALENDAR to determine current shift - UPDATED to preserve FactoryOrg
         """
         if faceid_df.empty:
             logger.warning("Empty FACEIDMapping dataframe provided")
@@ -969,6 +1006,7 @@ class XeusDataProcessor:
         
         for _, row in faceid_df.iterrows():
             ceid = row['CEID']
+            factory_org = row.get('FactoryOrg', None)  # PRESERVE FactoryOrg
             
             # Add ONLY the current shift group leader (determined from F_CALENDAR)
             shift_name_col = current_shift  # e.g., 'SGL4'
@@ -987,17 +1025,18 @@ class XeusDataProcessor:
                     'SHIFT_DESCRIPTION': shift_description,
                     'CALENDAR_SHIFT': shift_info.get('calendar_shift', 'Unknown'),
                     'SHIFT_START': shift_info.get('start_date', None),
-                    'SHIFT_END': shift_info.get('end_date', None)
+                    'SHIFT_END': shift_info.get('end_date', None),
+                    'FactoryOrg': factory_org  # ADDED: Preserve FactoryOrg
                 })
                 current_shift_found += 1
-                logger.debug(f"Added current shift contact: {row[shift_name_col]} ({shift_name_col}) for CEID {ceid}")
+                logger.debug(f"Added current shift contact: {row[shift_name_col]} ({shift_name_col}) for CEID {ceid}, FactoryOrg: {factory_org}")
             else:
                 current_shift_missing += 1
                 logger.warning(f"No {current_shift} contact found for CEID {ceid}")
                 logger.debug(f"  {shift_name_col}: {row.get(shift_name_col, 'NULL')}")
                 logger.debug(f"  {shift_wwid_col}: {row.get(shift_wwid_col, 'NULL')}")
             
-            # Still add managers (they work across all shifts)
+            # Still add managers (they work across all shifts) - WITH FactoryOrg
             # Department Manager (MgrGroup1)
             if pd.notna(row['MgrGroup1']) and pd.notna(row['MgrGroup1WWID']):
                 all_contacts.append({
@@ -1012,7 +1051,8 @@ class XeusDataProcessor:
                     'SHIFT_DESCRIPTION': 'All Shifts',
                     'CALENDAR_SHIFT': None,
                     'SHIFT_START': None,
-                    'SHIFT_END': None
+                    'SHIFT_END': None,
+                    'FactoryOrg': factory_org  # ADDED: Preserve FactoryOrg
                 })
             
             # Engineering Manager (MgrGroup3)
@@ -1029,7 +1069,8 @@ class XeusDataProcessor:
                     'SHIFT_DESCRIPTION': 'All Shifts',
                     'CALENDAR_SHIFT': None,
                     'SHIFT_START': None,
-                    'SHIFT_END': None
+                    'SHIFT_END': None,
+                    'FactoryOrg': factory_org  # ADDED: Preserve FactoryOrg
                 })
         
         if not all_contacts:
@@ -1048,12 +1089,16 @@ class XeusDataProcessor:
             role_counts = contacts_df['CONTACT_ROLE'].value_counts().to_dict()
             logger.info(f"  Role distribution: {role_counts}")
             
+            # Log FactoryOrg distribution
+            if 'FactoryOrg' in contacts_df.columns:
+                factory_org_counts = contacts_df['FactoryOrg'].value_counts().to_dict()
+                logger.info(f"  FactoryOrg distribution: {factory_org_counts}")
+            
             current_shift_contacts = contacts_df[contacts_df['IS_CURRENT_SHIFT'] == True]
             if not current_shift_contacts.empty:
                 logger.info(f"  Current shift contacts: {len(current_shift_contacts)}")
                 for _, contact in current_shift_contacts.iterrows():
-                    logger.info(f"    - {contact['CONTACT_NAME']} ({contact['SHIFT_ID']}) for CEID {contact['CEID']}")
-                    logger.info(f"      Calendar Shift: {contact['CALENDAR_SHIFT']}")
+                    logger.info(f"    - {contact['CONTACT_NAME']} ({contact['SHIFT_ID']}) for CEID {contact['CEID']}, FactoryOrg: {contact['FactoryOrg']}")
         
         return contacts_df
 
@@ -1143,7 +1188,7 @@ class XeusDataProcessor:
     def get_enhanced_contacts_for_ceids(self, ceids: List[str], current_shift_only: bool = True) -> pd.DataFrame:
         """
         Enhanced contact lookup using:
-        1. FACEIDMapping table from IEIndicators (CEIDs -> WWIDs + Names)
+        1. FACEIDMapping table from IEIndicators (CEIDs -> WWIDs + Names + FactoryOrg)
         2. F_WORKER table from Xeus (WWIDs -> Emails + Details)
         3. F_CALENDAR table from Xeus (Current Shift Detection)
         
@@ -1156,8 +1201,8 @@ class XeusDataProcessor:
             return pd.DataFrame()
         
         shift_mode = "CURRENT SHIFT ONLY (F_CALENDAR)" if current_shift_only else "ALL SHIFTS"
-        logger.info(f"Starting enhanced contacts lookup - {shift_mode}:")
-        logger.info("  - FACEIDMapping from IEIndicators")
+        logger.info(f"Starting enhanced contacts lookup with FactoryOrg - {shift_mode}:")
+        logger.info("  - FACEIDMapping from IEIndicators (including FactoryOrg)")
         logger.info("  - F_WORKER from Xeus")
         if current_shift_only:
             logger.info("  - F_CALENDAR from Xeus (shift detection)")
@@ -1169,13 +1214,13 @@ class XeusDataProcessor:
             logger.warning("No FACEIDMapping data found in IEIndicators")
             return pd.DataFrame()
         
-        # Step 2: Transform to contacts format
+        # Step 2: Transform to contacts format (preserving FactoryOrg)
         if current_shift_only:
             contacts_df = self.transform_faceid_to_contacts_current_shift(faceid_df)
-            logger.info("Using CURRENT SHIFT ONLY contact transformation (F_CALENDAR)")
+            logger.info("Using CURRENT SHIFT ONLY contact transformation (F_CALENDAR) with FactoryOrg")
         else:
             contacts_df = self.transform_faceid_to_contacts(faceid_df)
-            logger.info("Using ALL SHIFTS contact transformation")
+            logger.info("Using ALL SHIFTS contact transformation with FactoryOrg")
         
         if contacts_df.empty:
             logger.warning("No contacts extracted from FACEIDMapping")
@@ -1189,7 +1234,7 @@ class XeusDataProcessor:
         
         if not email_df.empty:
             # Merge email and employee data
-            logger.info("Merging Xeus F_WORKER data with IEIndicators contacts")
+            logger.info("Merging Xeus F_WORKER data with IEIndicators contacts (preserving FactoryOrg)")
             
             # Select relevant columns from F_WORKER
             worker_cols = ['WWID', 'FIRST_NAME', 'LAST_NAME', 'FULL_NAME', 'CORPORATE_EMAIL', 
@@ -1216,6 +1261,11 @@ class XeusDataProcessor:
             logger.info(f"  Contacts with emails from Xeus: {contacts_with_emails}")
             logger.info(f"  Email coverage: {(contacts_with_emails/total_contacts*100):.1f}%")
             
+            # Log FactoryOrg preservation
+            if 'FactoryOrg' in enhanced_contacts_df.columns:
+                factory_org_preserved = enhanced_contacts_df['FactoryOrg'].notna().sum()
+                logger.info(f"  FactoryOrg preserved: {factory_org_preserved}/{total_contacts}")
+            
             # Log current shift specific info
             if current_shift_only:
                 current_shift_contacts = enhanced_contacts_df[enhanced_contacts_df['IS_CURRENT_SHIFT'] == True]
@@ -1236,7 +1286,7 @@ class XeusDataProcessor:
 
     def merge_contacts_with_data(self, df: pd.DataFrame, contacts_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Merge the main dataframe with enhanced contacts information including F_WORKER data
+        Merge the main dataframe with enhanced contacts information including F_WORKER data and FactoryOrg
         """
         if df.empty:
             logger.warning("Empty main dataframe provided for contacts merge")
@@ -1264,13 +1314,14 @@ class XeusDataProcessor:
             df['CALENDAR_SHIFT'] = None
             df['SHIFT_START'] = None
             df['SHIFT_END'] = None
+            df['FactoryOrg'] = None  # ADDED
             return df
         
         if 'TARGET_CEID' not in df.columns:
             logger.error("TARGET_CEID column not found in main dataframe")
             return df
         
-        logger.info("Merging enhanced contacts (FACEIDMapping + F_WORKER + F_CALENDAR) with main data...")
+        logger.info("Merging enhanced contacts (FACEIDMapping + F_WORKER + F_CALENDAR + FactoryOrg) with main data...")
         
         # Perform left join to get all contacts for each TARGET_CEID
         merged_df = df.merge(
@@ -1289,18 +1340,25 @@ class XeusDataProcessor:
         merged_rows = len(merged_df)
         rows_with_contacts = merged_df['CONTACT_ROLE'].notna().sum()
         rows_with_emails = merged_df['EMAIL_ADDRESS'].notna().sum()
+        rows_with_factory_org = merged_df['FactoryOrg'].notna().sum() if 'FactoryOrg' in merged_df.columns else 0
         
         logger.info(f"Enhanced contacts merge completed:")
         logger.info(f"  - Original rows: {original_rows}")
         logger.info(f"  - Merged rows: {merged_rows}")
         logger.info(f"  - Rows with contacts: {rows_with_contacts}")
         logger.info(f"  - Rows with emails: {rows_with_emails}")
+        logger.info(f"  - Rows with FactoryOrg: {rows_with_factory_org}")
         logger.info(f"  - Expansion factor: {merged_rows/original_rows:.2f}x")
         
         # Log contact role distribution
         if not merged_df.empty and 'CONTACT_ROLE' in merged_df.columns:
             role_counts = merged_df['CONTACT_ROLE'].value_counts().to_dict()
             logger.info(f"  - Contact role distribution: {role_counts}")
+        
+        # Log FactoryOrg distribution
+        if not merged_df.empty and 'FactoryOrg' in merged_df.columns:
+            factory_org_counts = merged_df['FactoryOrg'].value_counts().to_dict()
+            logger.info(f"  - FactoryOrg distribution: {factory_org_counts}")
         
         return merged_df
 
@@ -1542,6 +1600,7 @@ class XeusDataProcessor:
     <tr><td><b>HOURS AT OPERATION</b></td><td>{safe_str(row['HOURS_AT_OPERATION'])} hours</td></tr>
     <tr><td><b>STATE</b></td><td>{safe_str(row['STATE'])}</td></tr>
     <tr><td><b>TARGET_CEID</b></td><td>{safe_str(row['TARGET_CEID'])}</td></tr>
+    <tr><td><b>FACTORY_ORG</b></td><td>{safe_str(row.get('FactoryOrg', 'N/A'))}</td></tr>
     <tr><td><b>ESCALATION_NODE</b></td><td>{safe_str(row['EMAIL_ADDRESS'])}</td></tr>
 </table>
 
@@ -1553,27 +1612,16 @@ NMPROD Automation Escalation System"""
         return body
 
     def send_escalation_emails(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Send escalation emails with ALL ACTIVE_EMAILS as CC"""
+        """Send escalation emails with TARGETED CC based on FactoryOrg matching"""
         if df.empty:
             logger.warning("No data provided for email sending")
             return {"success": False, "message": "No data to process"}
         
-        logger.info("Starting escalation email sending process...")
+        logger.info("Starting escalation email sending with TARGETED CC logic...")
         if self.test_mode:
-            logger.info("TEST MODE: Emails will be sent to test recipients (rishitha.kondrolla@intel.com, uriel.mendiola@intel.com)")
+            logger.info("TEST MODE: Emails will be sent to test recipients only")
         else:
-            logger.info("PRODUCTION MODE: TO: Individual contacts, CC: ALL ACTIVE_EMAILS from RW_Department, BCC: rishitha.kondrolla@intel.com")
-        
-        # Get ALL ACTIVE_EMAILS from ALL departments (no mapping needed) - only for production mode
-        all_active_emails = []
-        if not self.test_mode:
-            dept_df = self.get_rw_departments()
-            all_active_emails = self.get_all_active_emails(dept_df)
-            
-            if all_active_emails:
-                logger.info(f"Will CC {len(all_active_emails)} emails to all escalations: {all_active_emails}")
-            else:
-                logger.warning("No ACTIVE_EMAILS found in any department")
+            logger.info("PRODUCTION MODE: TO: Individual contacts, CC: Targeted ACTIVE_EMAILS based on FactoryOrg, BCC: rishitha.kondrolla@intel.com")
         
         stats = {
             'total_records': len(df),
@@ -1582,12 +1630,27 @@ NMPROD Automation Escalation System"""
             'emails_failed': 0,
             'no_email_address': 0,
             'state_1_skipped': 0,
-            'cc_emails_used': len(all_active_emails),
+            'targeted_cc_used': 0,
             'by_state': {'State 2': 0, 'State 3': 0, 'State 4': 0},
             'test_mode': self.test_mode
         }
         
         try:
+            # Get unique FactoryOrgs from the dataframe for targeted CC
+            if not self.test_mode and 'FactoryOrg' in df.columns:
+                unique_factory_orgs = df['FactoryOrg'].dropna().unique().tolist()
+                logger.info(f"Found FactoryOrgs in data: {unique_factory_orgs}")
+                
+                # Get targeted ACTIVE_EMAILS for these FactoryOrgs
+                targeted_cc_emails = self.get_relevant_active_emails_for_factory_org(unique_factory_orgs)
+                
+                if targeted_cc_emails:
+                    logger.info(f"Will CC {len(targeted_cc_emails)} targeted emails: {targeted_cc_emails}")
+                else:
+                    logger.warning("No targeted ACTIVE_EMAILS found for FactoryOrgs")
+            else:
+                targeted_cc_emails = []
+            
             for _, row in df.iterrows():
                 # Skip State 1 (non-escalation)
                 if row['STATE'] == 'State 1':
@@ -1600,9 +1663,10 @@ NMPROD Automation Escalation System"""
                     logger.warning(f"No email address for lot {row['LOT']}, operation {row['OPERATION']}, state {row['STATE']}")
                     continue
                 
-                # Get department/group name for display only
+                # Get department/group name for display
                 group_name = row.get('GROUP_NAME', None)
                 department = str(group_name) if pd.notna(group_name) else 'Unknown'
+                factory_org = row.get('FactoryOrg', 'Unknown')
                 
                 # Build email content
                 subject = self.build_email_subject(row['STATE'])
@@ -1617,38 +1681,34 @@ NMPROD Automation Escalation System"""
                     body=body,
                     recipient_name=row['FULL_NAME'] if pd.notna(row['FULL_NAME']) else 'Team Member',
                     state=row['STATE'],
-                    cc_emails=all_active_emails if not self.test_mode else ["uriel.mendiola@intel.com"],
-                    department=department
+                    cc_emails=targeted_cc_emails if not self.test_mode else ["uriel.mendiola@intel.com"],
+                    department=f"{department} ({factory_org})"
                 )
                 
                 if success:
                     stats['emails_sent'] += 1
+                    if targeted_cc_emails:
+                        stats['targeted_cc_used'] += 1
                     if row['STATE'] in stats['by_state']:
                         stats['by_state'][row['STATE']] += 1
                 else:
                     stats['emails_failed'] += 1
             
             mode = "TEST MODE" if self.test_mode else "PRODUCTION MODE"
-            logger.info(f"{mode} email sending completed:")
+            logger.info(f"{mode} TARGETED CC email sending completed:")
             logger.info(f"  Total records: {stats['total_records']}")
-            logger.info(f"  State 1 skipped: {stats['state_1_skipped']}")
-            logger.info(f"  Emails attempted: {stats['emails_attempted']}")
             logger.info(f"  Emails sent: {stats['emails_sent']}")
-            logger.info(f"  Emails failed: {stats['emails_failed']}")
-            logger.info(f"  No email address: {stats['no_email_address']}")
-            logger.info(f"  CC emails used: {stats['cc_emails_used']}")
+            logger.info(f"  Targeted CC used: {stats['targeted_cc_used']}")
             logger.info(f"  By state: {stats['by_state']}")
-            if not self.test_mode:
-                logger.info(f"  BCC recipient (all emails): {self.email_service.bcc_recipient}")
             
             return {
                 "success": True,
-                "message": f"{mode} email sending completed",
+                "message": f"{mode} targeted CC email sending completed",
                 "stats": stats
             }
             
         except Exception as e:
-            logger.error(f"Error in email sending process: {e}")
+            logger.error(f"Error in targeted CC email sending: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {
@@ -1935,7 +1995,7 @@ NMPROD Automation Escalation System"""
         # Then, compute TARGET_CEID
         df = self.compute_target_ceid(df)
         
-        # Get enhanced contacts from multiple datasources
+        # Get enhanced contacts from multiple datasources (including FactoryOrg)
         unique_ceids = df['TARGET_CEID'].dropna().unique().tolist()
         if unique_ceids:
             shift_mode = "current shift only (F_CALENDAR)" if current_shift_only else "all shifts"
@@ -1966,6 +2026,7 @@ NMPROD Automation Escalation System"""
             df['CALENDAR_SHIFT'] = None
             df['SHIFT_START'] = None
             df['SHIFT_END'] = None
+            df['FactoryOrg'] = None  # ADDED
         
         analysis = {
             "success": True,
@@ -2008,6 +2069,12 @@ NMPROD Automation Escalation System"""
             metro_counts = df[metro_col].value_counts().to_dict()
             analysis["metro_distribution"] = metro_counts
             logger.info(f"Metro distribution: {metro_counts}")
+        
+        # FactoryOrg analysis
+        if 'FactoryOrg' in df.columns:
+            factory_org_counts = df['FactoryOrg'].value_counts().to_dict()
+            analysis["factory_org_distribution"] = factory_org_counts
+            logger.info(f"FactoryOrg distribution: {factory_org_counts}")
         
         # TARGET_OPERATION analysis
         if 'TARGET_OPERATION' in df.columns:
@@ -2095,19 +2162,19 @@ NMPROD Automation Escalation System"""
         return analysis
 
     def run_full_process(self, current_shift_only: bool = True, send_emails: bool = False) -> tuple[pd.DataFrame, Dict[str, Any]]:
-        """Execute the complete data processing pipeline - simplified without department matching"""
+        """Execute the complete data processing pipeline with targeted CC based on FactoryOrg"""
         
         shift_mode = "CURRENT SHIFT ONLY (F_CALENDAR)" if current_shift_only else "ALL SHIFTS"
         
         logger.info("="*60)
-        logger.info(f"STARTING F_CALENDAR ENHANCED XEUS PIPELINE - {shift_mode}")
-        logger.info("Multi-datasource: F_CALENDAR + IEIndicators + Xeus + F11x")  # Added F11x back for ACTIVE_EMAILS
+        logger.info(f"STARTING F_CALENDAR ENHANCED XEUS PIPELINE WITH TARGETED CC - {shift_mode}")
+        logger.info("Multi-datasource: F_CALENDAR + IEIndicators + Xeus + F11x (Targeted CC)")
         if self.test_mode:
             logger.info("RUNNING IN TEST MODE - No database writes")
             if send_emails:
                 logger.info("TEST MODE EMAILS ENABLED - Sending to test recipients only")
         if send_emails and not self.test_mode:
-            logger.info("EMAIL SENDING ENABLED with CC/BCC support")
+            logger.info("EMAIL SENDING ENABLED with TARGETED CC/BCC support based on FactoryOrg")
         
         if current_shift_only:
             try:
@@ -2128,7 +2195,7 @@ NMPROD Automation Escalation System"""
             
             result_df = self.execute_xeus_query(dept_filter)
             
-            # Step 2: Process results (includes TARGET_OPERATION, TARGET_CEID, and enhanced contacts)
+            # Step 2: Process results (includes TARGET_OPERATION, TARGET_CEID, and enhanced contacts with FactoryOrg)
             analysis = self.process_results(result_df, current_shift_only=current_shift_only)
             
             # Get the processed dataframe with all computed columns
@@ -2149,12 +2216,12 @@ NMPROD Automation Escalation System"""
                 logger.warning("No data available for escalation tracking")
                 analysis["escalation_tracking"] = {"success": False, "message": "No data to process"}
             
-            # Step 4: Send emails if requested (with ALL ACTIVE_EMAILS as CC)
+            # Step 4: Send emails if requested (with TARGETED ACTIVE_EMAILS as CC based on FactoryOrg)
             if send_emails and not result_df.empty:
                 if self.test_mode:
                     logger.info("Starting TEST MODE escalation email sending to test recipients...")
                 else:
-                    logger.info("Starting escalation email sending with ALL ACTIVE_EMAILS as CC...")
+                    logger.info("Starting escalation email sending with TARGETED ACTIVE_EMAILS as CC based on FactoryOrg...")
                 email_result = self.send_escalation_emails(result_df)
                 analysis["email_sending"] = email_result
                 
@@ -2162,7 +2229,7 @@ NMPROD Automation Escalation System"""
                     if self.test_mode:
                         logger.info("TEST MODE email sending completed successfully")
                     else:
-                        logger.info("Email sending with CC/BCC completed successfully")
+                        logger.info("Email sending with TARGETED CC/BCC completed successfully")
                 else:
                     logger.error(f"Email sending failed: {email_result['message']}")
             elif send_emails:
@@ -2173,21 +2240,21 @@ NMPROD Automation Escalation System"""
                 analysis["email_sending"] = {"success": True, "message": "Email sending disabled"}
             
             logger.info("="*60)
-            logger.info(f"F_CALENDAR ENHANCED PIPELINE COMPLETED SUCCESSFULLY - {shift_mode}")
+            logger.info(f"F_CALENDAR ENHANCED PIPELINE WITH TARGETED CC COMPLETED SUCCESSFULLY - {shift_mode}")
             logger.info("="*60)
             
             return result_df, analysis
             
         except Exception as e:
-            logger.error(f"F_CALENDAR enhanced pipeline failed: {e}")
+            logger.error(f"F_CALENDAR enhanced pipeline with targeted CC failed: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return pd.DataFrame(), {"success": False, "message": str(e)}
 
 def display_results(df: pd.DataFrame, analysis: Dict[str, Any]):
-    """Display results in a formatted way including F_CALENDAR shift information"""
+    """Display results in a formatted way including F_CALENDAR shift information and FactoryOrg"""
     print("\n" + "="*60)
-    print("F_CALENDAR ENHANCED RESULTS SUMMARY")
+    print("F_CALENDAR ENHANCED RESULTS WITH TARGETED CC")
     print("="*60)
     
     # Display current shift information from F_CALENDAR
@@ -2230,6 +2297,12 @@ def display_results(df: pd.DataFrame, analysis: Dict[str, Any]):
                 for metro, count in analysis["metro_distribution"].items():
                     metro_label = "Metro" if metro == 'Y' else "Non-Metro"
                     print(f"  {metro_label}: {count}")
+            
+            # FactoryOrg analysis display
+            if "factory_org_distribution" in analysis:
+                print("\nFACTORY ORG DISTRIBUTION:")
+                for factory_org, count in analysis["factory_org_distribution"].items():
+                    print(f"  {factory_org}: {count}")
             
             # Enhanced Contacts analysis display
             if "contacts_summary" in analysis:
@@ -2285,12 +2358,12 @@ def display_results(df: pd.DataFrame, analysis: Dict[str, Any]):
             else:
                 print(f"  FAILED: {escalation_info.get('message', 'Unknown error')}")
         
-        # Add email sending results with CC/BCC info
+        # Add email sending results with TARGETED CC/BCC info
         if "email_sending" in analysis:
             email_info = analysis["email_sending"]
             test_mode = email_info.get("stats", {}).get("test_mode", False)
             mode = "TEST MODE" if test_mode else "PRODUCTION MODE"
-            print(f"\n{mode} EMAIL SENDING RESULTS:")
+            print(f"\n{mode} EMAIL SENDING RESULTS (TARGETED CC):")
             
             if email_info["success"]:
                 stats = email_info.get("stats", {})
@@ -2301,12 +2374,13 @@ def display_results(df: pd.DataFrame, analysis: Dict[str, Any]):
                     print(f"  Emails sent successfully: {stats.get('emails_sent', 0)}")
                     print(f"  Emails failed: {stats.get('emails_failed', 0)}")
                     print(f"  No email address: {stats.get('no_email_address', 0)}")
-                    print(f"  CC emails used: {stats.get('cc_emails_used', 0)}")
+                    print(f"  Targeted CC used: {stats.get('targeted_cc_used', 0)}")
                     print(f"  By state: {stats.get('by_state', {})}")
                     if test_mode:
                         print(f"  Test recipients: rishitha.kondrolla@intel.com (TO), uriel.mendiola@intel.com (CC)")
                     else:
                         print(f"  BCC recipient (all emails): rishitha.kondrolla@intel.com")
+                        print(f"  CC Logic: Targeted ACTIVE_EMAILS based on FactoryOrg pattern matching (F11X/F9)")
                 else:
                     print(f"  {email_info.get('message', 'Email sending completed')}")
             else:
@@ -2318,7 +2392,7 @@ def display_results(df: pd.DataFrame, analysis: Dict[str, Any]):
     print("="*60)
 
 def main(current_shift_only: bool = True, test_mode: bool = False, send_emails: bool = False, test_mode_with_emails: bool = False):
-    """Main execution function for F_CALENDAR-based escalation system with enhanced SMTP support"""
+    """Main execution function for F_CALENDAR-based escalation system with targeted CC support"""
     
     # Override send_emails if test_mode_with_emails is True
     if test_mode_with_emails:
@@ -2342,6 +2416,6 @@ if __name__ == "__main__":
     # Optional: Save results to file
     if not final_df.empty:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"f_calendar_shift_results_{timestamp}.csv"
+        filename = f"f_calendar_shift_results_targeted_cc_{timestamp}.csv"
         final_df.to_csv(filename, index=False)
-        logger.info(f"F_CALENDAR shift results saved to {filename}")
+        logger.info(f"F_CALENDAR shift results with targeted CC saved to {filename}")
