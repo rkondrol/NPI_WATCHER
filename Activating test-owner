@@ -1,0 +1,8 @@
+# Production mode without emails (database writes only)
+final_df, final_analysis = main(current_shift_only=True, test_mode=False, send_emails=False)
+
+# Test mode without emails (no database writes, no emails)
+final_df, final_analysis = main(current_shift_only=True, test_mode=True, send_emails=False)
+
+# All shifts mode (instead of current shift only)
+final_df, final_analysis = main(current_shift_only=False, test_mode=False, send_emails=True)
